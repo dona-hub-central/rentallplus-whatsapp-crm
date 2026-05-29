@@ -1,0 +1,19 @@
+{
+  "name": "rentallplus-whatsapp-crm",
+  "version": "1.0.0",
+  "description": "WhatsApp CRM multi-session for RentallPlus",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.26.0",
+    "qrcode": "^1.5.4",
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "mysql2": "^3.11.0",
+    "axios": "^1.7.0",
+    "socket.io": "^4.7.0",
+    "mime-types": "^2.1.35"
+  }
+}

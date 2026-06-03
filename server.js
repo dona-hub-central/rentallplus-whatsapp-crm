@@ -732,6 +732,26 @@ app.post("/conversations/:id/send-media", upload.single("file"), async (req, res
 // Servir media
 app.use("/media", express.static("/opt/whatsapp-crm/media"));
 
+// Actualizar tag de conversación
+app.patch("/conversations/:id/tag", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tag } = req.body; // 'pre-stay' | 'during-stay' | 'post-stay' | null
+    const allowed = [null, 'pre-stay', 'during-stay', 'post-stay'];
+    if (!allowed.includes(tag)) {
+      return res.status(400).json({ error: "Tag inválido" });
+    }
+    await db.execute("UPDATE wa_conversations SET tag = ? WHERE id = ?", [tag, id]);
+    const [rows] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!rows[0]) return res.status(404).json({ error: "Conversación no encontrada" });
+    io.emit("conversation_updated", rows[0]);
+    res.json({ success: true, conversation: rows[0] });
+  } catch (err) {
+    console.error("[tag] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // INICIAR SERVIDOR
 // ═══════════════════════════════════════════════════════════════

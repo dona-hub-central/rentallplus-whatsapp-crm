@@ -3,6 +3,16 @@ const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+
+// Evitar que promesas sin capturar tumben el proceso
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection] Promesa sin capturar:', reason?.message || reason);
+  // No re-lanzar — solo loguear
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err.message);
+  // Solo loguear errores no fatales
+});
 const qrcode = require("qrcode");
 const mysql = require("mysql2/promise");
 const axios = require("axios");
@@ -570,7 +580,15 @@ app.post("/conversations/:id/send", async (req, res) => {
   }
   
   // Enviar por WhatsApp
-  await session.client.sendMessage(conv[0].remote_jid, finalMessage);
+  if (!session?.client) {
+    return res.status(400).json({ error: "Sesión no conectada" });
+  }
+  try {
+    await session.client.sendMessage(conv[0].remote_jid, finalMessage);
+  } catch (sendErr) {
+    console.error('[sendMessage] Error al enviar:', sendErr.message);
+    return res.status(500).json({ error: "Error al enviar mensaje: " + sendErr.message });
+  }
   logMessage(conv[0].session_key);
   
   // Guardar en BD

@@ -8,6 +8,22 @@ const mysql = require("mysql2/promise");
 const axios = require("axios");
 const path = require("path");
 const fs = require("fs");
+const multer = require("multer");
+
+// Multer config for media uploads
+const mediaStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = "/opt/whatsapp-crm/media";
+    require("fs").mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const ext = require("path").extname(file.originalname) || ".bin";
+    cb(null, Date.now() + "_upload" + ext);
+  }
+});
+const upload = multer({ storage: mediaStorage, limits: { fileSize: 16 * 1024 * 1024 } });
+
 
 const app = express();
 const server = http.createServer(app);
@@ -635,6 +651,84 @@ app.post("/conversations/:id/create-ticket", async (req, res) => {
   res.json({ success: true });
 });
 
+// Enviar media (imagen, audio, documento)
+app.post("/conversations/:id/send-media", upload.single("file"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`[send-media] received: conv=${id} file=${req.file?.originalname} mime=${req.file?.mimetype} size=${req.file?.size}`);
+    const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!conv[0]) return res.status(404).json({ error: "Conversation not found" });
+
+    const session = sessions[conv[0].session_key];
+    if (!session?.client) return res.status(400).json({ error: "Session not connected" });
+
+    if (!req.file) return res.status(400).json({ error: "No file provided" });
+
+    // Rate limit check
+    const rateCheck = checkRateLimit(conv[0].session_key);
+    if (!rateCheck.allowed) {
+      fs.unlinkSync(req.file.path);
+      return res.status(429).json({
+        error: "Límite alcanzado",
+        message: `Máximo ${RATE_LIMIT} mensajes/hora. Espera ${rateCheck.waitMinutes} min.`,
+        waitMinutes: rateCheck.waitMinutes
+      });
+    }
+
+    let mimeType = req.file.mimetype || "application/octet-stream";
+    const filename = req.file.originalname || req.file.filename;
+
+    const fileData = fs.readFileSync(req.file.path);
+    const base64Data = fileData.toString("base64");
+    const media = new MessageMedia(mimeType, base64Data, filename);
+
+    // Caption opcional
+    const caption = req.body.caption || undefined;
+    const sendOptions = {};
+    if (caption) sendOptions.caption = caption;
+
+    // Nota de voz: solo si es audio OGG real (no webm del browser)
+    const isOggAudio = mimeType === "audio/ogg" || mimeType.startsWith("audio/ogg;");
+    if (isOggAudio) sendOptions.sendAudioAsVoice = true;
+
+    // Video como documento si no es mp4/3gp nativo
+    if (mimeType.startsWith("video/") && !mimeType.includes("mp4") && !mimeType.includes("3gp")) {
+      sendOptions.sendMediaAsDocument = true;
+    }
+
+    await session.client.sendMessage(conv[0].remote_jid, media, sendOptions);
+    logMessage(conv[0].session_key);
+
+    // Guardar en BD
+    const mediaUrl = "/media/" + req.file.filename;
+    const [result] = await db.execute(`
+      INSERT INTO wa_messages (conversation_id, direction, type, body, media_url, media_mime)
+      VALUES (?, 'out', ?, ?, ?, ?)
+    `, [id, mimeType.split("/")[0], caption || media.filename || "", mediaUrl, mimeType]);
+
+    await db.execute(`
+      UPDATE wa_conversations SET last_message = ?, last_message_at = NOW() WHERE id = ?
+    `, [`[${mimeType.split("/")[0]}]`, conv[0].id]);
+
+    const [rows] = await db.execute("SELECT * FROM wa_messages WHERE id = ?", [result.insertId]);
+    const savedMsg = rows[0];
+
+    io.emit("new_message", {
+      conversationId: Number(id),
+      message: savedMsg
+    });
+
+    res.json({ success: true, message: savedMsg });
+  } catch (err) {
+    console.error("[send-media] Error:", err.message || err);
+    console.error("[send-media] File info:", req.file?.originalname, req.file?.mimetype, req.file?.size);
+    if (req.file?.path) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+    res.status(500).json({ error: "Error enviando media: " + err.message });
+  }
+});
+
 // Servir media
 app.use("/media", express.static("/opt/whatsapp-crm/media"));
 
@@ -662,3 +756,4 @@ async function start() {
 }
 
 start().catch(console.error);
+

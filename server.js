@@ -46,7 +46,8 @@ app.use(express.json({ limit: "50mb" }));
 // CONFIGURACIÓN
 // ═══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3001;
-const MAX_SESSIONS = 3;
+const MAX_SESSIONS = 1;
+const ALLOWED_SESSION = 'session_1'; // Solo este número está permitido
 
 const dbConfig = {
   host: process.env.DB_HOST || "127.0.0.1",
@@ -61,29 +62,87 @@ const dbConfig = {
 // ═══════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════
-// RATE LIMITER - Max 8 mensajes por hora por sesión
+// RATE LIMITER — Anti-ban inteligente
+// Regla: máx 6 destinatarios distintos iniciados por nosotros en 20 min
+// Excepción: si el cliente escribió primero → sin límite
 // ═══════════════════════════════════════════════════════════════
-const RATE_LIMIT = 8;
-const RATE_WINDOW = 60 * 60 * 1000;
-const messageLog = {};
+const OUTBOUND_WINDOW_MS = 20 * 60 * 1000; // 20 minutos
+const MAX_OUTBOUND_RECIPIENTS = 6;          // máx destinatarios distintos que iniciamos
+// { sessionKey: [{ jid, ts }] }
+const outboundLog = {};
 
-function checkRateLimit(sessionKey) {
+// Comprueba si podemos enviar a este jid
+// inboundFirst=true → el cliente escribió antes, sin límite
+function checkRateLimit(sessionKey, jid, inboundFirst) {
+  if (inboundFirst) return { allowed: true, inbound: true };
+
   const now = Date.now();
-  if (!messageLog[sessionKey]) messageLog[sessionKey] = [];
-  messageLog[sessionKey] = messageLog[sessionKey].filter(ts => now - ts < RATE_WINDOW);
-  if (messageLog[sessionKey].length >= RATE_LIMIT) {
-    const waitTime = Math.ceil((RATE_WINDOW - (now - messageLog[sessionKey][0])) / 60000);
-    return { allowed: false, waitMinutes: waitTime, count: messageLog[sessionKey].length };
+  if (!outboundLog[sessionKey]) outboundLog[sessionKey] = [];
+
+  // Limpiar entradas fuera de la ventana
+  outboundLog[sessionKey] = outboundLog[sessionKey].filter(e => now - e.ts < OUTBOUND_WINDOW_MS);
+
+  // Contar destinatarios distintos en la ventana
+  const uniqueJids = new Set(outboundLog[sessionKey].map(e => e.jid));
+
+  if (uniqueJids.has(jid)) {
+    // Ya enviamos a este destinatario en la ventana → permitir (misma conversación)
+    return { allowed: true };
   }
-  return { allowed: true, count: messageLog[sessionKey].length };
+
+  if (uniqueJids.size >= MAX_OUTBOUND_RECIPIENTS) {
+    // Cuándo se libera el slot más antiguo
+    const oldest = outboundLog[sessionKey].find(e => !uniqueJids.has(e.jid) || e === outboundLog[sessionKey][0]);
+    const waitMs = oldest ? (OUTBOUND_WINDOW_MS - (now - oldest.ts)) : OUTBOUND_WINDOW_MS;
+    const waitMinutes = Math.ceil(waitMs / 60000);
+    return { allowed: false, waitMinutes, count: uniqueJids.size };
+  }
+
+  return { allowed: true, count: uniqueJids.size };
 }
 
-function logMessage(sessionKey) {
-  if (!messageLog[sessionKey]) messageLog[sessionKey] = [];
-  messageLog[sessionKey].push(Date.now());
+function logMessage(sessionKey, jid) {
+  if (!outboundLog[sessionKey]) outboundLog[sessionKey] = [];
+  outboundLog[sessionKey].push({ jid, ts: Date.now() });
 }
+// ═══════════════════════════════════════════════════════════════
+// ANTI-BAN: Humanización de envíos
+// ═══════════════════════════════════════════════════════════════
+
+function humanDelay(text) {
+  const chars = (text || '').length;
+  const base  = Math.min(Math.max(chars * 50, 1500), 6000);
+  const jitter = Math.floor(Math.random() * 1200);
+  return base + jitter;
+}
+
+// isWithinSendHours eliminado — el horario ya no restringe envíos
+// El anti-ban se gestiona por destinatarios únicos en ventana de tiempo
+
+async function sendWithHumanBehavior(client, jid, text) {
+  await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 700)));
+  try { await client.sendPresenceAvailable(); } catch(e) {}
+  try { await client.sendStateTyping(jid); } catch(e) {}
+  const delay = humanDelay(text);
+  await new Promise(r => setTimeout(r, delay));
+  const result = await client.sendMessage(jid, text);
+  try { await client.clearState(jid); } catch(e) {}
+  return result;
+}
+
 // ═══════════════════════════════════════════════════════════════
 const sessions = {};  // { "session_1": { client, status, phone, qr } }
+const emittedOutbound = new Set(); // IDs de mensajes salientes ya emitidos al frontend
+const sessionLocks = {};  // Mutex para evitar createSession() concurrentes
+
+function acquireLock(key) {
+  if (sessionLocks[key]) return false;
+  sessionLocks[key] = true;
+  return true;
+}
+function releaseLock(key) {
+  delete sessionLocks[key];
+}
 
 // ═══════════════════════════════════════════════════════════════
 // BASE DE DATOS
@@ -145,6 +204,16 @@ async function initDB() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       config_key VARCHAR(100) UNIQUE NOT NULL,
       config_value TEXT,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS wa_templates (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(200) NOT NULL,
+      body TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
   `);
@@ -219,24 +288,49 @@ async function callAI(messages, context) {
 // ═══════════════════════════════════════════════════════════════
 // IDENTIFICAR HUÉSPED POR TELÉFONO
 // ═══════════════════════════════════════════════════════════════
-async function findBookingByPhone(phone) {
-  // Limpiar número - quedarnos con últimos 9 dígitos
-  const cleanPhone = phone.replace(/\D/g, "").slice(-9);
-  
-  const [rows] = await db.execute(`
-    SELECT b.*, a.name as accommodation_name, a.address,
-           JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')) as client_phone,
-           JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.name')) as client_name,
-           JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.email')) as client_email
-    FROM bookings b
-    LEFT JOIN accommodations a ON b.accommodation_id = a.id
-    WHERE REPLACE(REPLACE(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')), ' ', ''), '+', ''), '-', '') LIKE ?
-    ORDER BY b.arrival_date DESC
-    LIMIT 1
-  `, ["%" + cleanPhone]);
-  
-  return rows[0] || null;
+async function findBookingByPhone(phone, name) {
+  const fields = "b.*, a.name as accommodation_name, a.address, " +
+    "JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')) as client_phone, " +
+    "JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.name')) as client_name, " +
+    "JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.email')) as client_email ";
+  const fromJoin = "FROM bookings b LEFT JOIN accommodations a ON b.accommodation_id = a.id ";
+
+  // 1) Match por teléfono — últimos 9 dígitos (cubre variaciones internacionales)
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length >= 7) {
+    const suffix = digits.slice(-9);
+    const [rows] = await db.execute(
+      "SELECT " + fields + fromJoin +
+      "WHERE REPLACE(REPLACE(REPLACE(REPLACE(JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')), ' ', ''), '+', ''), '-', ''), '.', '') LIKE ? " +
+      "AND JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')) NOT IN ('-', '', 'null') " +
+      "AND b.status NOT IN ('canceled') " +
+      "ORDER BY b.arrival_date DESC LIMIT 1",
+      ["%" + suffix]
+    );
+    if (rows[0]) return rows[0];
+  }
+
+  // 2) Fallback: primer nombre + apellido (NUNCA solo primer nombre)
+  if (name && name.length > 2 && name !== phone) {
+    const parts = name.trim().split(/\s+/).filter(Boolean);
+    const first = parts[0];
+    const last  = parts[1] || null;
+    if (last && first.length >= 3 && last.length >= 3) {
+      const [r1] = await db.execute(
+        "SELECT " + fields + fromJoin +
+        "WHERE JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.name')) LIKE ? " +
+        "AND JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.name')) LIKE ? " +
+        "AND b.status NOT IN ('canceled') " +
+        "ORDER BY b.arrival_date DESC LIMIT 1",
+        ["%" + first + "%", "%" + last + "%"]
+      );
+      if (r1[0]) return r1[0];
+    }
+  }
+
+  return null; // Sin match → asignación manual
 }
+
 
 async function getBookingTickets(bookingId) {
   const [rows] = await db.execute(`
@@ -244,7 +338,7 @@ async function getBookingTickets(bookingId) {
     FROM tickets t
     LEFT JOIN actions a ON t.action_id = a.id
     WHERE t.booking_id = ?
-    ORDER BY t.scheduled_date ASC
+    ORDER BY t.date ASC
   `, [bookingId]);
   return rows;
 }
@@ -252,9 +346,29 @@ async function getBookingTickets(bookingId) {
 // ═══════════════════════════════════════════════════════════════
 // GESTIÓN DE SESIONES WHATSAPP
 // ═══════════════════════════════════════════════════════════════
-async function createSession(sessionKey) {
+async function createSession(sessionKey, autoReconnect = false) {
+  // Solo se permite session_1
+  if (sessionKey !== ALLOWED_SESSION) {
+    console.warn('[createSession] Sesión ' + sessionKey + ' bloqueada — solo ' + ALLOWED_SESSION + ' permitida');
+    return { error: 'Only ' + ALLOWED_SESSION + ' is allowed' };
+  }
+  // Mutex: evitar múltiples llamadas concurrentes para la misma sesión
+  if (!acquireLock(sessionKey)) {
+    console.log('[createSession] Lock activo para ' + sessionKey + ' — ignorando llamada duplicada');
+    return { error: 'Session creation already in progress' };
+  }
+
+  try {
+  // Si existe pero está desconectado, destruir y recrear
   if (sessions[sessionKey]?.client) {
-    return { error: "Session already exists" };
+    const st = sessions[sessionKey].status;
+    if (st === "connected" || st === "connecting") {
+      return { error: "Session already exists" };
+    }
+    // Está disconnected en memoria — limpiar para recrear
+    try { await sessions[sessionKey].client.destroy(); } catch(e) {}
+    if (sessions[sessionKey]?.qrTimer) clearTimeout(sessions[sessionKey].qrTimer);
+    delete sessions[sessionKey];
   }
   
   const client = new Client({
@@ -265,39 +379,194 @@ async function createSession(sessionKey) {
     }
   });
   
-  sessions[sessionKey] = { client, status: "connecting", phone: null, qr: null };
+  sessions[sessionKey] = { client, status: "connecting", phone: null, qr: null, qrTimer: null };
   
   client.on("qr", async (qr) => {
+    // Si es reconexión automática y el auth expiró → NO mostrar QR, desconectar
+    if (autoReconnect) {
+      console.log('[autoReconnect] Auth expirado para ' + sessionKey + ' — QR requerido. Marcando disconnected.');
+      try { await sessions[sessionKey].client.destroy(); } catch(e) {}
+      delete sessions[sessionKey];
+      releaseLock(sessionKey);
+      await updateSessionDB(sessionKey, 'disconnected', null);
+      io.emit('session_disconnected', { sessionKey, reason: 'auth_expired' });
+      return;
+    }
     const qrDataUrl = await qrcode.toDataURL(qr);
     sessions[sessionKey].qr = qrDataUrl;
     sessions[sessionKey].status = "connecting";
     io.emit("session_qr", { sessionKey, qr: qrDataUrl });
     await updateSessionDB(sessionKey, "connecting", null);
+
+    // Auto-reset si no se escanea en 2 minutos
+    if (sessions[sessionKey].qrTimer) clearTimeout(sessions[sessionKey].qrTimer);
+    sessions[sessionKey].qrTimer = setTimeout(async () => {
+      if (sessions[sessionKey]?.status === "connecting") {
+        console.log("⏱️ QR timeout para " + sessionKey + " — reseteando a disconnected");
+        try { await sessions[sessionKey].client.destroy(); } catch (e) {}
+        delete sessions[sessionKey];
+        await updateSessionDB(sessionKey, "disconnected", null);
+        io.emit("session_disconnected", { sessionKey, reason: "qr_timeout" });
+      }
+    }, 2 * 60 * 1000); // 2 minutos
   });
   
+  // Flag para evitar que "ready" se dispare múltiples veces (bug whatsapp-web.js)
+  let _readyFired = false;
   client.on("ready", async () => {
+    if (_readyFired) {
+      console.log('[ready] Evento duplicado ignorado para ' + sessionKey);
+      return;
+    }
+    _readyFired = true;
     const phone = client.info?.wid?.user || "unknown";
+    if (sessions[sessionKey]?.qrTimer) { clearTimeout(sessions[sessionKey].qrTimer); sessions[sessionKey].qrTimer = null; }
     sessions[sessionKey].status = "connected";
     sessions[sessionKey].phone = phone;
     sessions[sessionKey].qr = null;
     io.emit("session_ready", { sessionKey, phone });
     await updateSessionDB(sessionKey, "connected", phone);
     console.log("✅ Session " + sessionKey + " connected: " + phone);
+    releaseLock(sessionKey);
   });
   
-  client.on("disconnected", async () => {
+  client.on("disconnected", async (reason) => {
+    if (sessions[sessionKey]?.qrTimer) { clearTimeout(sessions[sessionKey].qrTimer); sessions[sessionKey].qrTimer = null; }
     sessions[sessionKey].status = "disconnected";
     sessions[sessionKey].phone = null;
     io.emit("session_disconnected", { sessionKey });
     await updateSessionDB(sessionKey, "disconnected", null);
+    console.log("⚠️ Session " + sessionKey + " disconnected, reason: " + reason);
+
+    // Detectar posible ban y alertar por Telegram
+    const isBan = reason && (
+      String(reason).toUpperCase().includes('BANNED') ||
+      String(reason).toUpperCase().includes('CONFLICT') ||
+      String(reason).toUpperCase().includes('UNLAUNCHED')
+    );
+    if (isBan) {
+      console.error('[ALERTA BAN] Sesión ' + sessionKey + ' posiblemente baneada. Reason: ' + reason);
+      try {
+        const axios = require('axios');
+        await axios.post('https://api.telegram.org/bot8577028388:AAFRQPMNfuyUqjhAoVHjYCJ5EJCh2sqdoj0/sendMessage', {
+          chat_id: '1479879640',
+          text: '🚨 *WA CRM RentallPlus*\nSesión `' + sessionKey + '` posiblemente baneada.\nMotivo: `' + reason + '`\nRevisa en: https://wa.rentallplus.com',
+          parse_mode: 'Markdown'
+        });
+      } catch(e) { console.error('[ALERTA BAN] No se pudo enviar Telegram:', e.message); }
+    } else {
+      // Desconexión normal — notificar igualmente si es fuera de horario o inesperada
+      console.log('[disconnect] reason=' + reason + ' (reconexión automática si auth existe)');
+    }
+
+    // Auto-reconectar o pedir nuevo QR según el motivo
+    const authDir = "/opt/whatsapp-crm/.wwebjs_auth/session-" + sessionKey;
+    const _fs = require("fs");
+    const isLogout = reason === 'LOGOUT';
+
+    try { await client.destroy(); } catch(e) {}
+    delete sessions[sessionKey];
+    releaseLock(sessionKey);
+
+    if (isLogout) {
+      // LOGOUT = WA invalidó la sesión → borrar auth para no reconectar con credenciales viejas
+      console.warn('[LOGOUT] WA anuló sesión ' + sessionKey + '. Borrando auth y esperando nuevo QR.');
+      try {
+        if (_fs.existsSync(authDir)) {
+          _fs.rmSync(authDir, { recursive: true, force: true });
+          console.log('[LOGOUT] Auth dir borrado: ' + authDir);
+        }
+      } catch(e) { console.error('[LOGOUT] Error borrando auth:', e.message); }
+      await updateSessionDB(sessionKey, 'disconnected', null);
+      io.emit('session_disconnected', { sessionKey, reason: 'logout_manual_qr_needed' });
+      // Alerta Telegram
+      try {
+        const _axios = require('axios');
+        await _axios.post('https://api.telegram.org/bot8577028388:AAFRQPMNfuyUqjhAoVHjYCJ5EJCh2sqdoj0/sendMessage', {
+          chat_id: '1479879640',
+          text: '⚠️ *WA CRM RentallPlus*\nSesión `' + sessionKey + '` cerrada por WhatsApp (LOGOUT).\nNecesita nuevo QR en: https://wa.rentallplus.com/whatsapp/config',
+          parse_mode: 'Markdown'
+        });
+      } catch(e) {}
+    } else if (_fs.existsSync(authDir)) {
+      // Desconexión inesperada con auth válido → reconectar con delay largo
+      const jitter = Math.floor(Math.random() * 60000); // 0-60s extra
+      const delay = 120000 + jitter; // 2-3 min mínimo
+      console.log("🔄 Auth encontrado, reconectando " + sessionKey + " en " + Math.round(delay/1000) + "s...");
+      setTimeout(() => {
+        createSession(sessionKey).catch(e => console.error("[autoReconnect] " + e.message));
+      }, delay);
+    }
   });
   
   client.on("message", async (msg) => {
     await handleIncomingMessage(sessionKey, msg);
   });
+
+  // Capturar mensajes SALIENTES (enviados desde el móvil, WhatsApp Web, etc.)
+  client.on("message_create", async (msg) => {
+    if (!msg.fromMe) return; // solo salientes, los entrantes los maneja 'message'
+    try {
+      const chat = await msg.getChat();
+      const remoteJid = chat.id._serialized;
+
+      // Buscar conversación existente por jid
+      const [convRows] = await db.execute(
+        "SELECT * FROM wa_conversations WHERE session_key = ? AND remote_jid = ?",
+        [sessionKey, remoteJid]
+      );
+      if (!convRows[0]) return; // si no hay conversación previa no la creamos
+
+      const conversationId = convRows[0].id;
+
+      // Evitar duplicados: si ya fue emitido desde el endpoint de envío, ignorar
+      if (emittedOutbound.has(msg.id._serialized)) {
+        emittedOutbound.delete(msg.id._serialized);
+        return;
+      }
+
+      // También chequear BD por si acaso
+      const [existing] = await db.execute(
+        "SELECT id FROM wa_messages WHERE message_id = ?",
+        [msg.id._serialized]
+      );
+      if (existing[0]) return;
+
+      await db.execute(
+        "INSERT INTO wa_messages (conversation_id, message_id, direction, type, body) VALUES (?, ?, 'out', ?, ?)",
+        [conversationId, msg.id._serialized, msg.type, msg.body || '']
+      );
+
+      // Actualizar last_message
+      await db.execute(
+        "UPDATE wa_conversations SET last_message = ?, last_message_at = NOW() WHERE id = ?",
+        [(msg.body || '[media]').substring(0, 500), conversationId]
+      );
+
+      io.emit("new_message", {
+        sessionKey,
+        conversationId,
+        message: {
+          id: msg.id._serialized,
+          direction: "out",
+          type: msg.type,
+          body: msg.body,
+          mediaUrl: null,
+        },
+        conversation: { id: conversationId }
+      });
+    } catch (e) {
+      console.error('[message_create] Error:', e.message);
+    }
+  });
   
   await client.initialize();
+  // Lock se libera en "ready" o en "disconnected"
   return { success: true, sessionKey };
+  } catch(err) {
+    releaseLock(sessionKey);
+    throw err;
+  }
 }
 
 async function updateSessionDB(sessionKey, status, phone) {
@@ -313,8 +582,23 @@ async function updateSessionDB(sessionKey, status, phone) {
 // ═══════════════════════════════════════════════════════════════
 async function handleIncomingMessage(sessionKey, msg) {
   const remoteJid = msg.from;
-  const phone = remoteJid.split("@")[0];
-  const contactName = msg._data?.notifyName || phone;
+  let phone = remoteJid.split("@")[0];
+  let contactName = msg._data?.notifyName || phone;
+
+  // Para JIDs @lid (privacidad WA) el split no da el teléfono real
+  // Intentar obtenerlo del objeto contacto
+  try {
+    const contact = await msg.getContact();
+    if (contact?.number) {
+      phone = contact.number; // Número real sin +
+    }
+    if (contact?.pushname || contact?.name) {
+      contactName = contact.pushname || contact.name || contactName;
+    }
+  } catch (e) {
+    // Si falla, seguir con el fallback
+    console.warn('[handleIncomingMessage] getContact falló para', remoteJid, e.message);
+  }
   
   // Buscar o crear conversación
   let [convRows] = await db.execute(
@@ -327,7 +611,7 @@ async function handleIncomingMessage(sessionKey, msg) {
   
   if (convRows.length === 0) {
     // Buscar booking por teléfono
-    booking = await findBookingByPhone(phone);
+    booking = await findBookingByPhone(phone, contactName);
     
     try {
       const [result] = await db.execute(`
@@ -354,7 +638,18 @@ async function handleIncomingMessage(sessionKey, msg) {
     }
   } else {
     conversationId = convRows[0].id;
-    booking = convRows[0].booking_id ? await findBookingByPhone(phone) : null;
+    // Si el teléfono guardado es un LID (>12 dígitos sin prefijo de país válido), actualizarlo
+    const storedPhone = convRows[0].phone;
+    const isLid = storedPhone && storedPhone.length > 13 && storedPhone !== phone;
+    if (isLid && phone !== storedPhone) {
+      await db.execute('UPDATE wa_conversations SET phone = ? WHERE id = ?', [phone, conversationId]);
+      // Intentar vincular reserva ahora que tenemos el tel real
+      if (!convRows[0].booking_id) {
+        const b = await findBookingByPhone(phone, contactName);
+        if (b) await db.execute('UPDATE wa_conversations SET booking_id = ? WHERE id = ?', [b.id, conversationId]);
+      }
+    }
+    booking = convRows[0].booking_id ? await findBookingByPhone(phone, contactName) : null;
     
     await db.execute(`
       UPDATE wa_conversations 
@@ -389,6 +684,25 @@ async function handleIncomingMessage(sessionKey, msg) {
     VALUES (?, ?, 'in', ?, ?, ?, ?)
   `, [conversationId, msg.id._serialized, msg.type, msg.body, mediaUrl, mediaMime]);
   
+  // Auto-adjuntar media WA al ticket de check-in (action_id=3)
+  if (mediaUrl && booking) {
+    try {
+      const [checkinTickets] = await db.execute(
+        "SELECT id FROM tickets WHERE booking_id = ? AND action_id = 3 ORDER BY id DESC LIMIT 1",
+        [booking.id]
+      );
+      if (checkinTickets[0]) {
+        const comment = "[WA Media] " + (msg.body || mediaMime || "archivo");
+        const meta = JSON.stringify({ type: "wa_media", url: mediaUrl, mime: mediaMime, from: phone });
+        await db.execute(
+          "INSERT INTO comments (ticket_id, message, metadata, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())",
+          [checkinTickets[0].id, comment, meta]
+        );
+        console.log("[auto-attach] Media adjuntada al ticket check-in", checkinTickets[0].id);
+      }
+    } catch (e) { console.error("[auto-attach] Error:", e.message); }
+  }
+
   // Emitir a frontend
   const tickets = booking ? await getBookingTickets(booking.id) : [];
   
@@ -428,11 +742,11 @@ app.get("/sessions", async (req, res) => {
   res.json(result);
 });
 
-// Crear/conectar sesión
+// Crear/conectar sesión — solo session_1 permitida
 app.post("/sessions/:key/connect", async (req, res) => {
   const { key } = req.params;
-  if (!key.match(/^session_[1-3]$/)) {
-    return res.status(400).json({ error: "Invalid session key" });
+  if (key !== ALLOWED_SESSION) {
+    return res.status(403).json({ error: "Solo se permite " + ALLOWED_SESSION + ". No se pueden añadir más sesiones." });
   }
   const result = await createSession(key);
   res.json(result);
@@ -452,25 +766,33 @@ app.post("/sessions/:key/disconnect", async (req, res) => {
 // Conversaciones
 app.get("/conversations", async (req, res) => {
   try {
-    const { session } = req.query;
-    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 20));
-    const offset = Math.max(0, parseInt(req.query.offset) || 0);
-    
+    const { session, search } = req.query;
+    const limit = search ? 50 : Math.max(1, Math.min(100, parseInt(req.query.limit) || 20));
+    const offset = search ? 0 : Math.max(0, parseInt(req.query.offset) || 0);
+
     let query = `
       SELECT c.*, b.arrival_date, b.departure_date, a.name as accommodation_name
       FROM wa_conversations c
       LEFT JOIN bookings b ON c.booking_id = b.id
       LEFT JOIN accommodations a ON b.accommodation_id = a.id
     `;
+    const conditions = [];
     const params = [];
-    
+
     if (session && session !== "all") {
-      query += " WHERE c.session_key = ?";
+      conditions.push("c.session_key = ?");
       params.push(session);
     }
-    
+
+    if (search && search.trim()) {
+      const s = `%${search.trim()}%`;
+      conditions.push("(c.name LIKE ? OR c.phone LIKE ? OR a.name LIKE ?)");
+      params.push(s, s, s);
+    }
+
+    if (conditions.length) query += " WHERE " + conditions.join(" AND ");
     query += " ORDER BY c.last_message_at DESC LIMIT " + limit + " OFFSET " + offset;
-    
+
     const [rows] = await db.execute(query, params);
     res.json(rows);
   } catch (err) {
@@ -512,8 +834,8 @@ app.get("/conversations/:id/booking", async (req, res) => {
   if (!conv[0]) return res.status(404).json({ error: "Not found" });
   
   if (!conv[0].booking_id) {
-    // Intentar buscar por teléfono
-    const booking = await findBookingByPhone(conv[0].phone);
+    // Intentar buscar por teléfono y por nombre
+    const booking = await findBookingByPhone(conv[0].phone, conv[0].name);
     if (booking) {
       await db.execute("UPDATE wa_conversations SET booking_id = ? WHERE id = ?", [booking.id, id]);
       const tickets = await getBookingTickets(booking.id);
@@ -544,13 +866,20 @@ app.post("/conversations/:id/send", async (req, res) => {
   const session = sessions[conv[0].session_key];
   if (!session?.client) return res.status(400).json({ error: "Session not connected" });
 
-  // Rate limit check
-  const rateCheck = checkRateLimit(conv[0].session_key);
+  // Detectar si el cliente escribió antes que nosotros (inbound first)
+  const [lastMsgs] = await db.execute(
+    "SELECT direction FROM wa_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+    [id]
+  );
+  const inboundFirst = lastMsgs[0]?.direction === "in";
+
+  // Rate limit solo si somos nosotros quienes iniciamos
+  const rateCheck = checkRateLimit(conv[0].session_key, conv[0].remote_jid, inboundFirst);
   if (!rateCheck.allowed) {
     console.log(`[send] RATE LIMITED session=${conv[0].session_key} wait=${rateCheck.waitMinutes}min`);
     return res.status(429).json({
-      error: "Límite alcanzado",
-      message: `Máximo ${RATE_LIMIT} mensajes/hora. Espera ${rateCheck.waitMinutes} min.`,
+      error: "Espera un momento",
+      message: `Por favor espera ${rateCheck.waitMinutes} min antes de escribir a nuevos contactos. Límite: ${MAX_OUTBOUND_RECIPIENTS} conversaciones nuevas cada 20 min.`,
       waitMinutes: rateCheck.waitMinutes
     });
   }
@@ -579,39 +908,49 @@ app.post("/conversations/:id/send", async (req, res) => {
     if (aiResponse) finalMessage = aiResponse;
   }
   
-  // Enviar por WhatsApp
+  // Enviar con comportamiento humano (anti-ban)
   if (!session?.client) {
     return res.status(400).json({ error: "Sesión no conectada" });
   }
+  let sentMsg;
   try {
-    await session.client.sendMessage(conv[0].remote_jid, finalMessage);
+    sentMsg = await sendWithHumanBehavior(session.client, conv[0].remote_jid, finalMessage);
   } catch (sendErr) {
     console.error('[sendMessage] Error al enviar:', sendErr.message);
     return res.status(500).json({ error: "Error al enviar mensaje: " + sendErr.message });
   }
-  logMessage(conv[0].session_key);
-  
-  // Guardar en BD
+  logMessage(conv[0].session_key, conv[0].remote_jid);
+
+  // Guardar en BD con message_id — message_create se encarga del socket emit
+  const sentMsgId = sentMsg?.id?._serialized || null;
   await db.execute(`
-    INSERT INTO wa_messages (conversation_id, direction, type, body)
-    VALUES (?, 'out', 'text', ?)
-  `, [id, finalMessage]);
-  
+    INSERT INTO wa_messages (conversation_id, message_id, direction, type, body)
+    VALUES (?, ?, 'out', 'text', ?)
+  `, [id, sentMsgId, finalMessage]);
+
   await db.execute(`
     UPDATE wa_conversations SET last_message = ?, last_message_at = NOW() WHERE id = ?
   `, [finalMessage.substring(0, 500), id]);
-  
+
+  // Emitir inmediatamente al frontend para respuesta instantánea
   io.emit("new_message", {
     sessionKey: conv[0].session_key,
     conversationId: parseInt(id),
     message: {
+      id: sentMsgId,
       direction: "out",
       type: "text",
       body: finalMessage,
       timestamp: new Date()
     }
   });
-  
+
+  // Marcar como ya emitido para que message_create no lo duplique
+  if (sentMsgId) {
+    emittedOutbound.add(sentMsgId);
+    setTimeout(() => emittedOutbound.delete(sentMsgId), 15000);
+  }
+
   res.json({ success: true, message: finalMessage });
 });
 
@@ -652,21 +991,84 @@ app.post("/config/test-ai", async (req, res) => {
 
 // Crear ticket desde CRM
 app.post("/conversations/:id/create-ticket", async (req, res) => {
-  const { id } = req.params;
-  const { action_id, notes } = req.body;
-  
-  const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
-  if (!conv[0]?.booking_id) return res.status(400).json({ error: "No booking linked" });
-  
-  const [booking] = await db.execute("SELECT * FROM bookings WHERE id = ?", [conv[0].booking_id]);
-  if (!booking[0]) return res.status(404).json({ error: "Booking not found" });
-  
-  await db.execute(`
-    INSERT INTO tickets (booking_id, accommodation_id, action_id, status, notes, created_at, updated_at)
-    VALUES (?, ?, ?, 'pending', ?, NOW(), NOW())
-  `, [booking[0].id, booking[0].accommodation_id, action_id, notes || "Creado desde WhatsApp CRM"]);
-  
-  res.json({ success: true });
+  try {
+    const { id } = req.params;
+    const { action_id, notes } = req.body;
+
+    const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!conv[0]?.booking_id) return res.status(400).json({ error: "No booking linked" });
+
+    const [booking] = await db.execute("SELECT * FROM bookings WHERE id = ?", [conv[0].booking_id]);
+    if (!booking[0]) return res.status(404).json({ error: "Booking not found" });
+
+    // Obtener nombre de la acción para el título
+    const [actions] = await db.execute("SELECT name FROM actions WHERE id = ?", [action_id]);
+    const actionName = actions[0]?.name || "Ticket";
+
+    // Obtener nombre del alojamiento
+    const [accs] = await db.execute("SELECT name FROM accommodations WHERE id = ?", [booking[0].accommodation_id]);
+    const accName = accs[0]?.name || "";
+
+    const title = `${actionName}: ${accName} (WhatsApp)`;
+    const description = notes || "Creado desde WhatsApp CRM";
+
+    const [result] = await db.execute(`
+      INSERT INTO tickets (title, booking_id, accommodation_id, action_id, status, description, date, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'pending', ?, NOW(), NOW(), NOW())
+    `, [title, booking[0].id, booking[0].accommodation_id, action_id, description]);
+
+    res.json({ success: true, ticket_id: result.insertId, title });
+  } catch (err) {
+    console.error('[create-ticket] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Asignar reserva manualmente por localizador o código
+app.post("/conversations/:id/assign-booking", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { localizator } = req.body; // localizador o código de reserva
+    if (!localizator) return res.status(400).json({ error: "Localizator requerido" });
+
+    const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!conv[0]) return res.status(404).json({ error: "Conversación no encontrada" });
+
+    // Buscar por localizator o code
+    const search = localizator.trim();
+    const [bookings] = await db.execute(
+      "SELECT b.*, a.name as accommodation_name, " +
+      "JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.name')) as client_name, " +
+      "JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')) as client_phone " +
+      "FROM bookings b LEFT JOIN accommodations a ON b.accommodation_id = a.id " +
+      "WHERE b.localizator = ? OR b.code = ? LIMIT 1",
+      [search, search]
+    );
+
+    if (!bookings[0]) return res.status(404).json({ error: "Reserva no encontrada con ese localizador" });
+
+    const booking = bookings[0];
+    await db.execute(
+      "UPDATE wa_conversations SET booking_id = ? WHERE id = ?",
+      [booking.id, id]
+    );
+
+    res.json({ success: true, booking });
+  } catch (err) {
+    console.error('[assign-booking] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Desvincular reserva de una conversación
+app.post("/conversations/:id/unassign-booking", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.execute("UPDATE wa_conversations SET booking_id = NULL WHERE id = ?", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Enviar media (imagen, audio, documento)
@@ -682,13 +1084,18 @@ app.post("/conversations/:id/send-media", upload.single("file"), async (req, res
 
     if (!req.file) return res.status(400).json({ error: "No file provided" });
 
-    // Rate limit check
-    const rateCheck = checkRateLimit(conv[0].session_key);
+    // Rate limit — misma lógica: libre si el cliente escribió primero
+    const [lastMsgsMedia] = await db.execute(
+      "SELECT direction FROM wa_messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+      [conv[0].id]
+    );
+    const inboundFirstMedia = lastMsgsMedia[0]?.direction === "in";
+    const rateCheck = checkRateLimit(conv[0].session_key, conv[0].remote_jid, inboundFirstMedia);
     if (!rateCheck.allowed) {
       fs.unlinkSync(req.file.path);
       return res.status(429).json({
-        error: "Límite alcanzado",
-        message: `Máximo ${RATE_LIMIT} mensajes/hora. Espera ${rateCheck.waitMinutes} min.`,
+        error: "Espera un momento",
+        message: "Por favor espera " + rateCheck.waitMinutes + " min antes de escribir a nuevos contactos.",
         waitMinutes: rateCheck.waitMinutes
       });
     }
@@ -715,7 +1122,7 @@ app.post("/conversations/:id/send-media", upload.single("file"), async (req, res
     }
 
     await session.client.sendMessage(conv[0].remote_jid, media, sendOptions);
-    logMessage(conv[0].session_key);
+    logMessage(conv[0].session_key, conv[0].remote_jid);
 
     // Guardar en BD
     const mediaUrl = "/media/" + req.file.filename;
@@ -750,6 +1157,100 @@ app.post("/conversations/:id/send-media", upload.single("file"), async (req, res
 // Servir media
 app.use("/media", express.static("/opt/whatsapp-crm/media"));
 
+// ═══════════════════════════════════════════════════════════════
+// TRADUCCIÓN
+// ═══════════════════════════════════════════════════════════════
+app.post("/translate", async (req, res) => {
+  try {
+    const { text, targetLang, detectOnly } = req.body;
+    if (!text?.trim()) return res.json({ translated: text, detectedLang: null });
+
+    const config = await getAIConfig();
+    if (!config.ai_api_key) return res.status(400).json({ error: "IA no configurada" });
+
+    const systemPrompt = detectOnly
+      ? `Detect the language of the following text. Reply ONLY with the ISO 639-1 language code (e.g. en, fr, de, it, ar, zh, ja, pt, ru). Nothing else.`
+      : `You are a professional translator. Translate the following text to ${targetLang || 'Spanish (es)'}. Reply ONLY with the translated text, no explanations, no quotes.`;
+
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: text }
+    ];
+
+    let result = null;
+    if (config.ai_provider === "minimax") {
+      const r = await axios.post("https://api.minimaxi.chat/v1/text/chatcompletion_v2",
+        { model: config.ai_model || "abab6.5s-chat", messages },
+        { headers: { "Authorization": "Bearer " + config.ai_api_key, "Content-Type": "application/json" } }
+      );
+      result = r.data.choices?.[0]?.message?.content;
+    } else {
+      const r = await axios.post("https://api.openai.com/v1/chat/completions",
+        { model: config.ai_model || "gpt-4o-mini", messages },
+        { headers: { "Authorization": "Bearer " + config.ai_api_key, "Content-Type": "application/json" } }
+      );
+      result = r.data.choices?.[0]?.message?.content;
+    }
+
+    if (detectOnly) {
+      return res.json({ detectedLang: result?.trim()?.toLowerCase()?.substring(0, 5) || null });
+    }
+    res.json({ translated: result?.trim() || text });
+  } catch (err) {
+    console.error("[translate]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Debug: ver info de contacto por JID
+app.get("/debug/contact/:jid", async (req, res) => {
+  try {
+    const { jid } = req.params;
+    const session = Object.values(sessions).find(s => s.client);
+    if (!session?.client) return res.status(400).json({ error: "No hay sesión conectada" });
+    const contact = await session.client.getContactById(jid + "@lid");
+    res.json({
+      id: contact?.id,
+      number: contact?.number,
+      pushname: contact?.pushname,
+      name: contact?.name,
+      shortName: contact?.shortName,
+      isMyContact: contact?.isMyContact,
+      serialized: contact?.id?._serialized,
+      user: contact?.id?.user,
+      server: contact?.id?.server,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Re-resolver teléfonos LID en conversaciones existentes
+app.post("/conversations/resolve-phones", async (req, res) => {
+  try {
+    const [convs] = await db.execute("SELECT * FROM wa_conversations WHERE booking_id IS NULL");
+    let resolved = 0;
+    for (const conv of convs) {
+      const session = sessions[conv.session_key];
+      if (!session?.client) continue;
+      try {
+        const contact = await session.client.getContactById(conv.remote_jid);
+        if (contact?.number && contact.number !== conv.phone) {
+          const booking = await findBookingByPhone(contact.number);
+          await db.execute(
+            'UPDATE wa_conversations SET phone = ?, booking_id = ?, name = ? WHERE id = ?',
+            [contact.number, booking?.id || null, contact.pushname || contact.name || conv.name, conv.id]
+          );
+          if (booking) resolved++;
+        }
+      } catch(e) { /* contacto no disponible */ }
+    }
+    res.json({ success: true, resolved });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Actualizar tag de conversación
 app.patch("/conversations/:id/tag", async (req, res) => {
   try {
@@ -771,6 +1272,55 @@ app.patch("/conversations/:id/tag", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// PLANTILLAS
+// ═══════════════════════════════════════════════════════════════
+
+// GET todas las plantillas
+app.get("/templates", async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT * FROM wa_templates ORDER BY name ASC");
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST crear plantilla
+app.post("/templates", async (req, res) => {
+  try {
+    const { name, body } = req.body;
+    if (!name || !body) return res.status(400).json({ error: "name y body requeridos" });
+    const [result] = await pool.query("INSERT INTO wa_templates (name, body) VALUES (?, ?)", [name, body]);
+    const [rows] = await pool.query("SELECT * FROM wa_templates WHERE id = ?", [result.insertId]);
+    res.json(rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT actualizar plantilla
+app.put("/templates/:id", async (req, res) => {
+  try {
+    const { name, body } = req.body;
+    await pool.query("UPDATE wa_templates SET name = ?, body = ? WHERE id = ?", [name, body, req.params.id]);
+    const [rows] = await pool.query("SELECT * FROM wa_templates WHERE id = ?", [req.params.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE plantilla
+app.delete("/templates/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM wa_templates WHERE id = ?", [req.params.id]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // INICIAR SERVIDOR
 // ═══════════════════════════════════════════════════════════════
 async function start() {
@@ -780,7 +1330,7 @@ async function start() {
   const authDir = '/opt/whatsapp-crm/.wwebjs_auth';
   const fs = require('fs');
   if (fs.existsSync(authDir)) {
-    const sessionDirs = fs.readdirSync(authDir).filter(d => d.startsWith('session-'));
+    const sessionDirs = fs.readdirSync(authDir).filter(d => d === 'session-' + ALLOWED_SESSION);
     for (const dir of sessionDirs) {
       const sessionKey = dir.replace('session-', '');
       console.log("🔄 Reconnecting " + sessionKey + " (auth found)...");
@@ -795,3 +1345,40 @@ async function start() {
 
 start().catch(console.error);
 
+
+// ═══════════════════════════════════════════════════════════════
+// TICKET COMMENTS
+// ═══════════════════════════════════════════════════════════════
+app.get('/tickets/:id/comments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await db.execute(
+      'SELECT * FROM comments WHERE ticket_id = ? AND deleted_at IS NULL ORDER BY created_at ASC',
+      [id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('[comments] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/tickets/:id/comments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { message, metadata } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+    await db.execute(
+      'INSERT INTO comments (ticket_id, message, metadata, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())',
+      [id, message, metadata ? JSON.stringify(metadata) : null]
+    );
+    const [rows] = await db.execute(
+      'SELECT * FROM comments WHERE ticket_id = ? AND deleted_at IS NULL ORDER BY created_at ASC',
+      [id]
+    );
+    res.json({ success: true, comments: rows });
+  } catch (err) {
+    console.error('[comments post] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});

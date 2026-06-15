@@ -119,13 +119,17 @@ function humanDelay(text) {
 // isWithinSendHours eliminado — el horario ya no restringe envíos
 // El anti-ban se gestiona por destinatarios únicos en ventana de tiempo
 
-async function sendWithHumanBehavior(client, jid, text) {
+async function sendWithHumanBehavior(client, jid, text, options = {}) {
   await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 700)));
   try { await client.sendPresenceAvailable(); } catch(e) {}
   try { await client.sendStateTyping(jid); } catch(e) {}
   const delay = humanDelay(text);
   await new Promise(r => setTimeout(r, delay));
-  const result = await client.sendMessage(jid, text);
+  const sendOpts = {};
+  if (options.mentions && Array.isArray(options.mentions) && options.mentions.length > 0) {
+    sendOpts.mentions = options.mentions;
+  }
+  const result = await client.sendMessage(jid, text, sendOpts);
   try { await client.clearState(jid); } catch(e) {}
   return result;
 }
@@ -193,11 +197,23 @@ async function initDB() {
       body TEXT,
       media_url VARCHAR(500),
       media_mime VARCHAR(100),
+      author VARCHAR(255),
       timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_conv (conversation_id),
       INDEX idx_timestamp (timestamp)
     )
   `);
+  // Migración: añadir columna author si no existe en BDs antiguas
+  try {
+    const [authorCol] = await db.execute(`
+      SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wa_messages' AND COLUMN_NAME = 'author'
+    `);
+    if (authorCol.length === 0) {
+      await db.execute("ALTER TABLE wa_messages ADD COLUMN author VARCHAR(255) NULL AFTER media_mime");
+      console.log('[migration] Added wa_messages.author column');
+    }
+  } catch (e) { console.warn('[migration] author column check failed:', e.message); }
   
   await db.execute(`
     CREATE TABLE IF NOT EXISTS wa_config (
@@ -550,9 +566,15 @@ async function createSession(sessionKey, autoReconnect = false) {
   // Capturar mensajes SALIENTES (enviados desde el móvil, WhatsApp Web, etc.)
   client.on("message_create", async (msg) => {
     if (!msg.fromMe) return; // solo salientes, los entrantes los maneja 'message'
+    if (msg.isStatus) return; // ignorar nuestros propios estados (stories)
     try {
       const chat = await msg.getChat();
       const remoteJid = chat.id._serialized;
+      if (
+        remoteJid === 'status@broadcast' ||
+        remoteJid.includes('status@') ||
+        remoteJid.includes('broadcast')
+      ) return;
 
       // Buscar conversación existente por jid
       const [convRows] = await db.execute(
@@ -625,6 +647,9 @@ async function updateSessionDB(sessionKey, status, phone) {
 // MANEJO DE MENSAJES ENTRANTES
 // ═══════════════════════════════════════════════════════════════
 async function handleIncomingMessage(sessionKey, msg) {
+  // Filtrar mensajes de estado de WhatsApp (stories)
+  if (msg.isStatus) return;
+
   const remoteJid = msg.from;
 
   // Ignorar mensajes de estado, broadcast y JIDs del sistema
@@ -638,6 +663,7 @@ async function handleIncomingMessage(sessionKey, msg) {
   const isGroup = remoteJid.endsWith('@g.us');
   let phone = isGroup ? remoteJid : remoteJid.split('@')[0];
   let contactName = msg._data?.notifyName || phone;
+  let authorName = null; // Para mensajes de grupo: nombre del remitente individual
 
   if (isGroup) {
     // Para grupos: obtener nombre del chat
@@ -646,6 +672,24 @@ async function handleIncomingMessage(sessionKey, msg) {
       if (chat?.name) contactName = chat.name;
     } catch (e) {
       console.warn('[handleIncomingMessage] getChat falló para grupo', remoteJid, e.message);
+    }
+    // Resolver el autor real del mensaje dentro del grupo
+    try {
+      const authorJid = msg.author || msg._data?.author;
+      if (authorJid) {
+        try {
+          const authorContact = await msg.getContact();
+          // En grupos, getContact() devuelve el contacto del autor
+          authorName = authorContact?.pushname || authorContact?.name || authorContact?.number || null;
+        } catch (e) { /* fallback abajo */ }
+        if (!authorName) {
+          authorName = msg._data?.notifyName || (authorJid.split('@')[0]) || null;
+        }
+      } else {
+        authorName = msg._data?.notifyName || null;
+      }
+    } catch (e) {
+      console.warn('[handleIncomingMessage] author resolve falló', e.message);
     }
   } else {
     // Para JIDs @lid (privacidad WA) el split no da el teléfono real
@@ -760,9 +804,9 @@ async function handleIncomingMessage(sessionKey, msg) {
   } catch(e) { /* sin menciones o error */ }
 
   await db.execute(`
-    INSERT INTO wa_messages (conversation_id, message_id, direction, type, body, media_url, media_mime)
-    VALUES (?, ?, 'in', ?, ?, ?, ?)
-  `, [conversationId, msg.id._serialized, msg.type, bodyFinal, mediaUrl, mediaMime]);
+    INSERT INTO wa_messages (conversation_id, message_id, direction, type, body, media_url, media_mime, author)
+    VALUES (?, ?, 'in', ?, ?, ?, ?, ?)
+  `, [conversationId, msg.id._serialized, msg.type, bodyFinal, mediaUrl, mediaMime, authorName]);
   
   // Auto-adjuntar media WA al ticket de check-in (action_id=3)
   if (mediaUrl && booking) {
@@ -793,7 +837,8 @@ async function handleIncomingMessage(sessionKey, msg) {
       id: msg.id._serialized,
       direction: "in",
       type: msg.type,
-      body: msg.body,
+      body: bodyFinal,
+      author: authorName,
       mediaUrl,
       mediaMime,
       timestamp: new Date()
@@ -941,7 +986,7 @@ app.get("/conversations/:id/booking", async (req, res) => {
 // Enviar mensaje
 app.post("/conversations/:id/send", async (req, res) => {
   const { id } = req.params;
-  const { message, useAI } = req.body;
+  const { message, useAI, mentions } = req.body;
   
   const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
   if (!conv[0]) return res.status(404).json({ error: "Conversation not found" });
@@ -997,7 +1042,8 @@ app.post("/conversations/:id/send", async (req, res) => {
   }
   let sentMsg;
   try {
-    sentMsg = await sendWithHumanBehavior(session.client, conv[0].remote_jid, finalMessage);
+    const opts = Array.isArray(mentions) && mentions.length > 0 ? { mentions } : {};
+    sentMsg = await sendWithHumanBehavior(session.client, conv[0].remote_jid, finalMessage, opts);
   } catch (sendErr) {
     console.error('[sendMessage] Error al enviar:', sendErr.message);
     return res.status(500).json({ error: "Error al enviar mensaje: " + sendErr.message });
@@ -1350,6 +1396,75 @@ app.patch("/conversations/:id/tag", async (req, res) => {
     res.json({ success: true, conversation: rows[0] });
   } catch (err) {
     console.error("[tag] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Renombrar conversación (nombre mostrado en CRM)
+app.patch("/conversations/:id/name", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: "name requerido" });
+    }
+    const newName = name.trim().substring(0, 255);
+    await db.execute("UPDATE wa_conversations SET name = ? WHERE id = ?", [newName, id]);
+    const [rows] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!rows[0]) return res.status(404).json({ error: "Conversación no encontrada" });
+    io.emit("conversation_updated", rows[0]);
+    res.json({ success: true, conversation: rows[0] });
+  } catch (err) {
+    console.error("[rename] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Marcar conversación como no leída
+app.post("/conversations/:id/unread", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.execute("UPDATE wa_conversations SET unread_count = unread_count + 1 WHERE id = ?", [id]);
+    const [rows] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!rows[0]) return res.status(404).json({ error: "Conversación no encontrada" });
+    io.emit("conversation_updated", rows[0]);
+    res.json({ success: true, unread_count: rows[0].unread_count });
+  } catch (err) {
+    console.error("[unread] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Listar participantes de un grupo (para autocompletar @menciones)
+app.get("/conversations/:id/participants", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
+    if (!conv[0]) return res.status(404).json({ error: "Conversación no encontrada" });
+    if (!conv[0].remote_jid.endsWith('@g.us')) {
+      return res.status(400).json({ error: "No es un grupo" });
+    }
+    const session = sessions[conv[0].session_key];
+    if (!session?.client) return res.status(400).json({ error: "Sesión no conectada" });
+
+    const chat = await session.client.getChatById(conv[0].remote_jid);
+    const participants = chat?.participants || [];
+    const results = [];
+    for (const p of participants) {
+      const jid = p.id?._serialized || (p.id?.user ? p.id.user + '@' + (p.id.server || 'c.us') : null);
+      if (!jid) continue;
+      let name = jid.split('@')[0];
+      let phone = jid.split('@')[0];
+      try {
+        const contact = await session.client.getContactById(jid);
+        name = contact?.pushname || contact?.name || contact?.shortName || name;
+        if (contact?.number) phone = contact.number;
+      } catch (e) { /* keep fallback */ }
+      results.push({ id: jid, name, phone, isAdmin: !!p.isAdmin });
+    }
+    res.json(results);
+  } catch (err) {
+    console.error("[participants] Error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });

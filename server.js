@@ -373,9 +373,14 @@ async function createSession(sessionKey, autoReconnect = false) {
   
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: sessionKey }),
+    webVersionCache: {
+      type: 'local',
+      path: '/opt/whatsapp-crm/.wwebjs_cache'
+    },
+    webVersion: '2.3000.1041453086',
     puppeteer: {
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
     }
   });
   
@@ -428,6 +433,24 @@ async function createSession(sessionKey, autoReconnect = false) {
     await updateSessionDB(sessionKey, "connected", phone);
     console.log("✅ Session " + sessionKey + " connected: " + phone);
     releaseLock(sessionKey);
+    // Actualizar nombres de grupos existentes en BD
+    setTimeout(async () => {
+      try {
+        const chats = await client.getChats();
+        for (const chat of chats) {
+          if (chat.isGroup && chat.name) {
+            const jid = chat.id._serialized;
+            await db.execute(
+              'UPDATE wa_conversations SET name = ? WHERE session_key = ? AND remote_jid = ?',
+              [chat.name, sessionKey, jid]
+            ).catch(() => {});
+          }
+        }
+        console.log('[ready] Nombres de grupos sincronizados');
+      } catch(e) {
+        console.warn('[ready] Error sincronizando grupos:', e.message);
+      }
+    }, 5000);
   });
   
   client.on("disconnected", async (reason) => {
@@ -582,22 +605,42 @@ async function updateSessionDB(sessionKey, status, phone) {
 // ═══════════════════════════════════════════════════════════════
 async function handleIncomingMessage(sessionKey, msg) {
   const remoteJid = msg.from;
-  let phone = remoteJid.split("@")[0];
+
+  // Ignorar mensajes de estado, broadcast y JIDs del sistema
+  if (
+    remoteJid === 'status@broadcast' ||
+    remoteJid.includes('status@') ||
+    remoteJid.includes('broadcast') ||
+    remoteJid.startsWith('7000') // lista de estados de WA
+  ) return;
+
+  const isGroup = remoteJid.endsWith('@g.us');
+  let phone = isGroup ? remoteJid : remoteJid.split('@')[0];
   let contactName = msg._data?.notifyName || phone;
 
-  // Para JIDs @lid (privacidad WA) el split no da el teléfono real
-  // Intentar obtenerlo del objeto contacto
-  try {
-    const contact = await msg.getContact();
-    if (contact?.number) {
-      phone = contact.number; // Número real sin +
+  if (isGroup) {
+    // Para grupos: obtener nombre del chat
+    try {
+      const chat = await msg.getChat();
+      if (chat?.name) contactName = chat.name;
+    } catch (e) {
+      console.warn('[handleIncomingMessage] getChat falló para grupo', remoteJid, e.message);
     }
-    if (contact?.pushname || contact?.name) {
-      contactName = contact.pushname || contact.name || contactName;
+  } else {
+    // Para JIDs @lid (privacidad WA) el split no da el teléfono real
+    // Intentar obtenerlo del objeto contacto
+    try {
+      const contact = await msg.getContact();
+      if (contact?.number) {
+        phone = contact.number; // Número real sin +
+      }
+      if (contact?.pushname || contact?.name) {
+        contactName = contact.pushname || contact.name || contactName;
+      }
+    } catch (e) {
+      // Si falla, seguir con el fallback
+      console.warn('[handleIncomingMessage] getContact falló para', remoteJid, e.message);
     }
-  } catch (e) {
-    // Si falla, seguir con el fallback
-    console.warn('[handleIncomingMessage] getContact falló para', remoteJid, e.message);
   }
   
   // Buscar o crear conversación
@@ -789,6 +832,9 @@ app.get("/conversations", async (req, res) => {
       conditions.push("(c.name LIKE ? OR c.phone LIKE ? OR a.name LIKE ?)");
       params.push(s, s, s);
     }
+
+    // Excluir siempre JIDs de estado/broadcast
+    conditions.push("c.remote_jid NOT LIKE '%status%' AND c.remote_jid NOT LIKE '%broadcast%' AND c.phone NOT LIKE '7000%'");
 
     if (conditions.length) query += " WHERE " + conditions.join(" AND ");
     query += " ORDER BY c.last_message_at DESC LIMIT " + limit + " OFFSET " + offset;

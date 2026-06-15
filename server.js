@@ -447,6 +447,27 @@ async function createSession(sessionKey, autoReconnect = false) {
           }
         }
         console.log('[ready] Nombres de grupos sincronizados');
+
+        // Resolver LIDs: contactos con phone >13 dígitos
+        const [lidRows] = await db.execute(
+          "SELECT id, remote_jid FROM wa_conversations WHERE session_key = ? AND LENGTH(phone) > 13 AND remote_jid LIKE '%@lid'",
+          [sessionKey]
+        );
+        let resolved = 0;
+        for (const row of lidRows) {
+          try {
+            const contact = await client.getContactById(row.remote_jid);
+            if (contact?.number && contact.number.length <= 15) {
+              const name = contact.pushname || contact.name || null;
+              await db.execute(
+                'UPDATE wa_conversations SET phone = ?' + (name ? ', name = ?' : '') + ' WHERE id = ?',
+                name ? [contact.number, name, row.id] : [contact.number, row.id]
+              );
+              resolved++;
+            }
+          } catch(e) { /* contacto no disponible */ }
+        }
+        if (lidRows.length) console.log('[ready] LIDs resueltos: ' + resolved + '/' + lidRows.length);
       } catch(e) {
         console.warn('[ready] Error sincronizando grupos:', e.message);
       }
@@ -722,10 +743,26 @@ async function handleIncomingMessage(sessionKey, msg) {
     }
   }
   
+  // Resolver @menciones LID → nombre real en el cuerpo del mensaje
+  let bodyFinal = msg.body || '';
+  try {
+    const mentions = await msg.getMentions();
+    for (const contact of mentions) {
+      const mentionName = contact.pushname || contact.name || contact.number || '';
+      if (mentionName) {
+        // Reemplazar @LID o @número por @NombreReal
+        const lidNum = contact.id?.user || '';
+        const realNum = contact.number || lidNum;
+        bodyFinal = bodyFinal.replace(new RegExp('@' + lidNum, 'g'), '@' + mentionName);
+        if (realNum !== lidNum) bodyFinal = bodyFinal.replace(new RegExp('@' + realNum, 'g'), '@' + mentionName);
+      }
+    }
+  } catch(e) { /* sin menciones o error */ }
+
   await db.execute(`
     INSERT INTO wa_messages (conversation_id, message_id, direction, type, body, media_url, media_mime)
     VALUES (?, ?, 'in', ?, ?, ?, ?)
-  `, [conversationId, msg.id._serialized, msg.type, msg.body, mediaUrl, mediaMime]);
+  `, [conversationId, msg.id._serialized, msg.type, bodyFinal, mediaUrl, mediaMime]);
   
   // Auto-adjuntar media WA al ticket de check-in (action_id=3)
   if (mediaUrl && booking) {

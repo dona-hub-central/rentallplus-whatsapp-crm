@@ -214,6 +214,11 @@ async function initDB() {
       console.log('[migration] Added wa_messages.author column');
     }
   } catch (e) { console.warn('[migration] author column check failed:', e.message); }
+  // Migracion booking_id_2
+  try {
+    await db.execute("ALTER TABLE wa_conversations ADD COLUMN booking_id_2 INT(11) DEFAULT NULL");
+    console.log('[migration] booking_id_2 ready');
+  } catch (e) { /* ya existe */ }
   
   await db.execute(`
     CREATE TABLE IF NOT EXISTS wa_config (
@@ -661,7 +666,7 @@ async function handleIncomingMessage(sessionKey, msg) {
   ) return;
 
   const isGroup = remoteJid.endsWith('@g.us');
-  let phone = isGroup ? remoteJid : remoteJid.split('@')[0];
+  let phone = remoteJid.split('@')[0]; // grupo: ID numerico, contacto: numero
   let contactName = msg._data?.notifyName || phone;
   let authorName = null; // Para mensajes de grupo: nombre del remitente individual
 
@@ -896,10 +901,12 @@ app.get("/conversations", async (req, res) => {
     const offset = search ? 0 : Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
-      SELECT c.*, b.arrival_date, b.departure_date, a.name as accommodation_name
+      SELECT c.*, b.arrival_date, b.departure_date, b.localizator as booking_localizator, a.name as accommodation_name, b2.localizator as booking_localizator_2, a2.name as accommodation_name_2, NULLIF(JSON_UNQUOTE(JSON_EXTRACT(b.client, '$.phone')), 'null') as booking_client_phone
       FROM wa_conversations c
       LEFT JOIN bookings b ON c.booking_id = b.id
       LEFT JOIN accommodations a ON b.accommodation_id = a.id
+      LEFT JOIN bookings b2 ON c.booking_id_2 = b2.id
+      LEFT JOIN accommodations a2 ON b2.accommodation_id = a2.id
     `;
     const conditions = [];
     const params = [];
@@ -979,8 +986,14 @@ app.get("/conversations/:id/booking", async (req, res) => {
     WHERE b.id = ?
   `, [conv[0].booking_id]);
   
+  let booking2 = null;
+  if (conv[0].booking_id_2) {
+    const [b2rows] = await db.execute(`SELECT b.*, a.name as accommodation_name FROM bookings b LEFT JOIN accommodations a ON b.accommodation_id = a.id WHERE b.id = ?`, [conv[0].booking_id_2]);
+    booking2 = b2rows[0] || null;
+  }
   const tickets = await getBookingTickets(conv[0].booking_id);
-  res.json({ booking: bookings[0] || null, tickets });
+  const tickets2 = conv[0].booking_id_2 ? await getBookingTickets(conv[0].booking_id_2) : [];
+  res.json({ booking: bookings[0] || null, booking2, tickets: [...tickets, ...tickets2] });
 });
 
 // Enviar mensaje
@@ -1052,6 +1065,11 @@ app.post("/conversations/:id/send", async (req, res) => {
 
   // Guardar en BD con message_id — message_create se encarga del socket emit
   const sentMsgId = sentMsg?.id?._serialized || null;
+  // Marcar ANTES de los awaits para evitar race condition con message_create
+  if (sentMsgId) {
+    emittedOutbound.add(sentMsgId);
+    setTimeout(() => emittedOutbound.delete(sentMsgId), 15000);
+  }
   await db.execute(`
     INSERT INTO wa_messages (conversation_id, message_id, direction, type, body)
     VALUES (?, ?, 'out', 'text', ?)
@@ -1074,11 +1092,6 @@ app.post("/conversations/:id/send", async (req, res) => {
     }
   });
 
-  // Marcar como ya emitido para que message_create no lo duplique
-  if (sentMsgId) {
-    emittedOutbound.add(sentMsgId);
-    setTimeout(() => emittedOutbound.delete(sentMsgId), 15000);
-  }
 
   res.json({ success: true, message: finalMessage });
 });
@@ -1160,6 +1173,7 @@ app.post("/conversations/:id/assign-booking", async (req, res) => {
     const { localizator } = req.body; // localizador o código de reserva
     if (!localizator) return res.status(400).json({ error: "Localizator requerido" });
 
+    const { slot } = req.body;
     const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
     if (!conv[0]) return res.status(404).json({ error: "Conversación no encontrada" });
 
@@ -1177,12 +1191,10 @@ app.post("/conversations/:id/assign-booking", async (req, res) => {
     if (!bookings[0]) return res.status(404).json({ error: "Reserva no encontrada con ese localizador" });
 
     const booking = bookings[0];
-    await db.execute(
-      "UPDATE wa_conversations SET booking_id = ? WHERE id = ?",
-      [booking.id, id]
-    );
+    const field = (slot === 2) ? "booking_id_2" : "booking_id";
+    await db.execute(`UPDATE wa_conversations SET ${field} = ? WHERE id = ?`, [booking.id, id]);
 
-    res.json({ success: true, booking });
+    res.json({ success: true, booking, slot: slot === 2 ? 2 : 1 });
   } catch (err) {
     console.error('[assign-booking] Error:', err.message);
     res.status(500).json({ error: err.message });
@@ -1193,7 +1205,9 @@ app.post("/conversations/:id/assign-booking", async (req, res) => {
 app.post("/conversations/:id/unassign-booking", async (req, res) => {
   try {
     const { id } = req.params;
-    await db.execute("UPDATE wa_conversations SET booking_id = NULL WHERE id = ?", [id]);
+    const { slot: uslot } = req.body;
+    const ufield = (uslot === 2) ? "booking_id_2" : "booking_id";
+    await db.execute(`UPDATE wa_conversations SET ${ufield} = NULL WHERE id = ?`, [id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

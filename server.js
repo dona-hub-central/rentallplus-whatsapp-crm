@@ -120,18 +120,29 @@ function humanDelay(text) {
 // El anti-ban se gestiona por destinatarios únicos en ventana de tiempo
 
 async function sendWithHumanBehavior(client, jid, text, options = {}) {
-  await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 700)));
-  try { await client.sendPresenceAvailable(); } catch(e) {}
-  try { await client.sendStateTyping(jid); } catch(e) {}
-  const delay = humanDelay(text);
-  await new Promise(r => setTimeout(r, delay));
-  const sendOpts = {};
-  if (options.mentions && Array.isArray(options.mentions) && options.mentions.length > 0) {
-    sendOpts.mentions = options.mentions;
-  }
-  const result = await client.sendMessage(jid, text, sendOpts);
-  try { await client.clearState(jid); } catch(e) {}
-  return result;
+  return new Promise(async (resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('Timeout al enviar — la sesión WA puede estar inestable. Intenta de nuevo.'));
+    }, 20000);
+    try {
+      await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 700)));
+      try { await client.sendPresenceAvailable(); } catch(e) {}
+      try { await client.sendStateTyping(jid); } catch(e) {}
+      const delay = humanDelay(text);
+      await new Promise(r => setTimeout(r, delay));
+      const sendOpts = {};
+      if (options.mentions && Array.isArray(options.mentions) && options.mentions.length > 0) {
+        sendOpts.mentions = options.mentions;
+      }
+      const result = await client.sendMessage(jid, text, sendOpts);
+      try { await client.clearState(jid); } catch(e) {}
+      clearTimeout(timer);
+      resolve(result);
+    } catch(e) {
+      clearTimeout(timer);
+      reject(e);
+    }
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -218,6 +229,11 @@ async function initDB() {
   try {
     await db.execute("ALTER TABLE wa_conversations ADD COLUMN booking_id_2 INT(11) DEFAULT NULL");
     console.log('[migration] booking_id_2 ready');
+  } catch (e) { /* ya existe */ }
+  // Migracion name_locked — evita sobreescribir nombres manuales
+  try {
+    await db.execute("ALTER TABLE wa_conversations ADD COLUMN name_locked TINYINT(1) DEFAULT 0");
+    console.log('[migration] name_locked ready');
   } catch (e) { /* ya existe */ }
   
   await db.execute(`
@@ -478,11 +494,12 @@ async function createSession(sessionKey, autoReconnect = false) {
         for (const row of lidRows) {
           try {
             const contact = await client.getContactById(row.remote_jid);
-            if (contact?.number && contact.number.length <= 15) {
+            const realPhone = (contact?.id?.server === 'c.us' && contact?.id?.user) ? contact.id.user : contact?.number;
+            if (realPhone && realPhone !== row.phone) {
               const name = contact.pushname || contact.name || null;
               await db.execute(
                 'UPDATE wa_conversations SET phone = ?' + (name ? ', name = ?' : '') + ' WHERE id = ?',
-                name ? [contact.number, name, row.id] : [contact.number, row.id]
+                name ? [realPhone, name, row.id] : [realPhone, row.id]
               );
               resolved++;
             }
@@ -766,7 +783,8 @@ async function handleIncomingMessage(sessionKey, msg) {
     
     await db.execute(`
       UPDATE wa_conversations 
-      SET last_message = ?, last_message_at = NOW(), unread_count = unread_count + 1, name = ?
+      SET last_message = ?, last_message_at = NOW(), unread_count = unread_count + 1,
+      name = IF(name_locked = 1, name, ?)
       WHERE id = ?
     `, [(msg.body || "[media]").substring(0, 500), contactName, conversationId]);
   }
@@ -918,8 +936,8 @@ app.get("/conversations", async (req, res) => {
 
     if (search && search.trim()) {
       const s = `%${search.trim()}%`;
-      conditions.push("(c.name LIKE ? OR c.phone LIKE ? OR a.name LIKE ?)");
-      params.push(s, s, s);
+      conditions.push("(c.name LIKE ? OR c.phone LIKE ? OR a.name LIKE ? OR b.localizator LIKE ? OR b2.localizator LIKE ?)");
+      params.push(s, s, s, s, s);
     }
 
     // Excluir siempre JIDs de estado/broadcast
@@ -999,7 +1017,7 @@ app.get("/conversations/:id/booking", async (req, res) => {
 // Enviar mensaje
 app.post("/conversations/:id/send", async (req, res) => {
   const { id } = req.params;
-  const { message, useAI, mentions } = req.body;
+  const { message, useAI, mentions, sent_by } = req.body;
   
   const [conv] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
   if (!conv[0]) return res.status(404).json({ error: "Conversation not found" });
@@ -1071,9 +1089,9 @@ app.post("/conversations/:id/send", async (req, res) => {
     setTimeout(() => emittedOutbound.delete(sentMsgId), 15000);
   }
   await db.execute(`
-    INSERT INTO wa_messages (conversation_id, message_id, direction, type, body)
-    VALUES (?, ?, 'out', 'text', ?)
-  `, [id, sentMsgId, finalMessage]);
+    INSERT INTO wa_messages (conversation_id, message_id, direction, type, body, author)
+    VALUES (?, ?, 'out', 'text', ?, ?)
+  `, [id, sentMsgId, finalMessage, sent_by || null]);
 
   await db.execute(`
     UPDATE wa_conversations SET last_message = ?, last_message_at = NOW() WHERE id = ?
@@ -1088,6 +1106,7 @@ app.post("/conversations/:id/send", async (req, res) => {
       direction: "out",
       type: "text",
       body: finalMessage,
+      author: sent_by || null,
       timestamp: new Date()
     }
   });
@@ -1270,9 +1289,9 @@ app.post("/conversations/:id/send-media", upload.single("file"), async (req, res
     // Guardar en BD
     const mediaUrl = "/media/" + req.file.filename;
     const [result] = await db.execute(`
-      INSERT INTO wa_messages (conversation_id, direction, type, body, media_url, media_mime)
-      VALUES (?, 'out', ?, ?, ?, ?)
-    `, [id, mimeType.split("/")[0], caption || media.filename || "", mediaUrl, mimeType]);
+      INSERT INTO wa_messages (conversation_id, direction, type, body, media_url, media_mime, author)
+      VALUES (?, 'out', ?, ?, ?, ?, ?)
+    `, [id, mimeType.split("/")[0], caption || media.filename || "", mediaUrl, mimeType, req.body.sent_by || null]);
 
     await db.execute(`
       UPDATE wa_conversations SET last_message = ?, last_message_at = NOW() WHERE id = ?
@@ -1371,20 +1390,22 @@ app.get("/debug/contact/:jid", async (req, res) => {
 // Re-resolver teléfonos LID en conversaciones existentes
 app.post("/conversations/resolve-phones", async (req, res) => {
   try {
-    const [convs] = await db.execute("SELECT * FROM wa_conversations WHERE booking_id IS NULL");
+    const [convs] = await db.execute("SELECT * FROM wa_conversations WHERE remote_jid LIKE '%@lid' AND LENGTH(phone) > 13");
     let resolved = 0;
     for (const conv of convs) {
       const session = sessions[conv.session_key];
       if (!session?.client) continue;
       try {
         const contact = await session.client.getContactById(conv.remote_jid);
-        if (contact?.number && contact.number !== conv.phone) {
-          const booking = await findBookingByPhone(contact.number);
+        const realPhone = (contact?.id?.server === 'c.us' && contact?.id?.user) ? contact.id.user : contact?.number;
+        if (realPhone && realPhone !== conv.phone) {
+          const booking = await findBookingByPhone(realPhone);
+          const newName = contact.pushname || contact.name || conv.name;
           await db.execute(
             'UPDATE wa_conversations SET phone = ?, booking_id = ?, name = ? WHERE id = ?',
-            [contact.number, booking?.id || null, contact.pushname || contact.name || conv.name, conv.id]
+            [realPhone, booking?.id || null, newName, conv.id]
           );
-          if (booking) resolved++;
+          resolved++;
         }
       } catch(e) { /* contacto no disponible */ }
     }
@@ -1423,7 +1444,7 @@ app.patch("/conversations/:id/name", async (req, res) => {
       return res.status(400).json({ error: "name requerido" });
     }
     const newName = name.trim().substring(0, 255);
-    await db.execute("UPDATE wa_conversations SET name = ? WHERE id = ?", [newName, id]);
+    await db.execute("UPDATE wa_conversations SET name = ?, name_locked = 1 WHERE id = ?", [newName, id]);
     const [rows] = await db.execute("SELECT * FROM wa_conversations WHERE id = ?", [id]);
     if (!rows[0]) return res.status(404).json({ error: "Conversación no encontrada" });
     io.emit("conversation_updated", rows[0]);
